@@ -241,40 +241,40 @@ async def handle_webhook(request: web.Request) -> web.Response:
         except Exception as e:
             print(f"⚠️ Error during role fetch/assignment: {e}")
 
-    # choose the right embed based on outcome
-    if status != "Approved":
-        title = "❌ Verification Failed"
-        description = (
-            "Your verification did not complete successfully. "
-            "You can try again or contact an admin for help."
-        )
-        color = discord.Color.red()
-    elif assigned:
-        title = "✅ Verification Complete"
-        description = f"You’ve been granted: **{', '.join(assigned)}**"
-        color = discord.Color.green()
-    else:
-        title = "❌ Verification Not Eligible"
-        description = (
-            "It looks like you didn’t meet our age requirements. "
-            "If this seems wrong, please reach out to a server admin."
-        )
-        color = discord.Color.red()
+        # build the final embed
+        if status != "Approved":
+            title = "❌ Verification Failed"
+            description = "Your verification did not complete successfully. You can try again or contact an admin."
+            color = discord.Color.red()
+        elif assigned:
+            title = "✅ Verification Complete"
+            description = f"You’ve been granted: **{', '.join(assigned)}**"
+            color = discord.Color.green()
+        else:
+            title = "❌ Verification Not Eligible"
+            description = "It looks like you didn’t meet our age requirements. If this seems wrong, please reach out to a server admin."
+            color = discord.Color.red()
 
-    # PATCH the original ephemeral message
-    if token and member:
-        edit_url = (
-            f"https://discord.com/api/v10/webhooks/"
-            f"{bot.user.id}/{token}/messages/@original"
-        )
-        embed = discord.Embed(title=title, description=description, color=color)
-        async with aiohttp.ClientSession() as sess_http:
-            await sess_http.patch(
-                edit_url,
-                json={"embeds": [embed.to_dict()], "components": []},
-                headers={"Authorization": f"Bot {DISCORD_TOKEN}"}
+        # if we have a valid interaction token & member, replace the ephemeral
+        if token and member:
+            embed = discord.Embed(title=title, description=description, color=color)
+
+            # 1) DELETE the original ephemeral response
+            #    DELETE /webhooks/{app_id}/{token}/messages/@original :contentReference[oaicite:0]{index=0}
+            await bot.http.delete_original_interaction_response(
+                application_id=bot.user.id,
+                interaction_token=token
             )
-        print(f"🔄 Edited ephemeral verification message for user {user_id}")
+
+            # 2) POST a brand‐new ephemeral follow-up
+            #    POST /webhooks/{app_id}/{token} with flags=64 :contentReference[oaicite:1]{index=1}
+            await bot.http.create_followup_message(
+                application_id=bot.user.id,
+                interaction_token=token,
+                data={"embeds": [embed.to_dict()], "flags": 64}
+            )
+
+            print(f"🗑️ Deleted original and sent new ephemeral for user {user_id}")
 
     return web.Response(text="OK")
 
