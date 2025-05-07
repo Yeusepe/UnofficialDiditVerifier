@@ -125,7 +125,7 @@ class VerifyView(View):
             embed = discord.Embed(
                 title="🔗 Complete Your Verification",
                 description=(
-                    "Click **Start Verification** below to open the secure KYC flow.\n"
+                    "Click **Start Verification** below to open the secure identification flow.\n"
                     "Once you finish, you’ll get your age-based role(s)."
                 ),
                 color=discord.Color.blue()
@@ -182,24 +182,26 @@ async def handle_webhook(request: web.Request) -> web.Response:
         raise web.HTTPUnauthorized()
 
     data        = json.loads(body)
-    status      = data.get("status")
+    status      = data.get("status")       # e.g. "Approved", "Denied", etc.
     session_id  = data.get("session_id")
     vendor_data = data.get("vendor_data")
 
-    if status == "Approved" and vendor_data:
-        info   = json.loads(vendor_data)
-        guild  = bot.get_guild(info["guild"])
-        member = guild.get_member(info["user"])
-        roles_cfg = config["verified_role"].get(str(guild.id))
-        assigned = []
+    # early exit on missing vendor data
+    if not vendor_data or not session_id:
+        return web.Response(text="OK")
 
-        # Age‐threshold logic
-        if isinstance(roles_cfg, dict) and session_id:
+    info   = json.loads(vendor_data)
+    guild  = bot.get_guild(info["guild"])
+    member = guild.get_member(info["user"])
+    roles_cfg = config["verified_role"].get(str(guild.id))
+
+    assigned = []
+
+    if status == "Approved":
+        # fetch their DOB and assign roles as before…
+        try:
             token = await get_access_token()
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             decision_url = f"{DIDIT_SESSION_URL}{session_id}/decision/"
             async with aiohttp.ClientSession() as sess2:
                 async with sess2.get(decision_url, headers=headers) as resp2:
@@ -210,39 +212,80 @@ async def handle_webhook(request: web.Request) -> web.Response:
             if dob:
                 birth = datetime.strptime(dob, "%Y-%m-%d").date()
                 today = date.today()
-                age_years = today.year - birth.year - (
-                    (today.month, today.day) < (birth.month, birth.day)
-                )
-                for age_thr, role_id in roles_cfg.items():
-                    if age_years >= int(age_thr):
-                        role = guild.get_role(role_id)
-                        if role:
-                            try:
+                age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+
+                # age‐threshold logic (dict or int)
+                if isinstance(roles_cfg, dict):
+                    for thr, role_id in roles_cfg.items():
+                        if age >= int(thr):
+                            role = guild.get_role(role_id)
+                            if role:
                                 await member.add_roles(role)
-                                assigned.append(f"{role.name} ({age_thr}+)")
-                            except Forbidden:
-                                pass
+                                assigned.append(f"{role.name} ({thr}+)")
+                elif isinstance(roles_cfg, int):
+                    role = guild.get_role(roles_cfg)
+                    if role:
+                        await member.add_roles(role)
+                        assigned.append(role.name)
 
-        # Fallback legacy single‐role
-        elif isinstance(roles_cfg, int):
-            role = guild.get_role(roles_cfg)
-            if role:
-                try:
-                    await member.add_roles(role)
-                    assigned.append(role.name)
-                except Forbidden:
-                    pass
+            # persist username
+            config["sessions"].setdefault(session_id, {})["username"] = str(member)
+            save_config(config)
 
-        # Log & persist
+        except Exception as e:
+            print(f"⚠️ Error assigning roles or fetching decision: {e}")
+
+        # now DM based on assigned list
         if assigned:
-            print(f"✅ Assigned {assigned} to {member} in {guild.name}")
-            if session_id:
-                config["sessions"].setdefault(session_id, {})["username"] = str(member)
-                save_config(config)
+            # Success
+            try:
+                embed = discord.Embed(
+                    title="✅ Verification Complete",
+                    description=(
+                        "You’ve successfully finished verification and have been granted: "
+                        f"**{', '.join(assigned)}**"
+                    ),
+                    color=discord.Color.green()
+                )
+                await member.send(embed=embed)
+                print(f"✅ Sent success DM to {member}")
+            except Exception as e:
+                print(f"❌ Failed to send success DM to {member}: {e}")
+
         else:
-            print(f"⚠️ No roles assigned for {member} in {guild.name}")
+            # Underage / no matching role
+            try:
+                embed = discord.Embed(
+                    title="❌ Verification Not Eligible",
+                    description=(
+                        "It looks like you didn’t meet our age requirements for any role. "
+                        "If you believe this is an error, please contact a server administrator."
+                    ),
+                    color=discord.Color.red()
+                )
+                await member.send(embed=embed)
+                print(f"⚠️ Sent underage DM to {member}")
+            except Exception as e:
+                print(f"❌ Failed to send underage DM to {member}: {e}")
+
+    else:
+        # status != Approved → outright failure
+        try:
+            embed = discord.Embed(
+                title="❌ Verification Failed",
+                description=(
+                    "Your verification did not complete successfully. "
+                    "Feel free to try again or contact support if you need help."
+                ),
+                color=discord.Color.red()
+            )
+            await member.send(embed=embed)
+            print(f"⚠️ Sent failure DM to {member} (status={status})")
+        except Exception as e:
+            print(f"❌ Failed to send failure DM to {member}: {e}")
 
     return web.Response(text="OK")
+
 
 # ─── Redirect Handler ────────────────────────────────────────────────────────────
 async def handle_redirect(request: web.Request) -> web.Response:
